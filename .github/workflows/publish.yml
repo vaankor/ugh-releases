@@ -1,0 +1,545 @@
+# Публикация версии Ultimate Gaming Hub — ТОЛЬКО вручную, ТОЛЬКО в публичном репозитории релизов (vaankor/ugh-releases).
+#
+# Почему здесь, а не в приватном репозитории с исходниками:
+#   - закрытый ключ подписи хранится ТОЛЬКО в Environment `release-signing` этого репозитория;
+#     для публичных репозиториев GitHub позволяет требовать ручное подтверждение (required reviewers)
+#     на любом тарифе, а для приватных — только на Enterprise;
+#   - код этого workflow берётся из main этого репозитория (Environment пускает только main),
+#     а не из коммита тега в приватном репозитории: изменённый там workflow ключ получить не может.
+#
+# Запуск: Actions → Publish UGH release → Run workflow (ветка main). Поля:
+#   version  — без «v», например 1.22.0;
+#   mode     — check: все проверки кандидата, без подписи и публикации (подтверждение не нужно);
+#              test: подпись (после подтверждения) + пре-релиз — обычные пользователи его НЕ видят,
+#                    проверка на своём ПК через UGH_UPDATER_ENDPOINT (см. UGH-RELEASE-GUIDE.md);
+#              publish: подпись (после подтверждения) + релиз для всех, или перевод проверенного пре-релиза в релиз;
+#              withdraw: снять релиз с раздачи (черновик), «последней» снова станет предыдущая стабильная версия;
+#   confirm  — test: «TEST v1.22.0», publish: «PUBLISH v1.22.0», withdraw: «WITHDRAW v1.22.0».
+#
+# Задачи и доступ к секретам:
+#   inputs     — проверка полей; секретов нет;
+#   candidate  — Environment `release-source` (только main): токен ЧТЕНИЯ приватного репозитория. Находит тег,
+#                проверяет, что его коммит входит в main, что сборка этого тега успешна, скачивает кандидат
+#                (без подписи) и проверяет всё, включая то, что в программу встроен закреплённый ключ
+#                release-config/updater.pub. Ключа подписи здесь нет;
+#   sign       — Environment `release-signing` (только main + ОБЯЗАТЕЛЬНОЕ ПОДТВЕРЖДЕНИЕ): закрытый ключ
+#                только в шаге подписи; запускает только Tauri CLI из tools/package-lock.json и скрипт этого
+#                репозитория; права только на чтение; ничего не публикует;
+#   publish    — права на запись в этот репозиторий (GITHUB_TOKEN), ключа нет: черновик → сверка → релиз;
+#                затем скачивание без авторизации, как это делает программа, и повторная проверка.
+name: Publish UGH release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия без v, например 1.22.0"
+        required: true
+        type: string
+      mode:
+        description: "check — проверить; test — пре-релиз для проверки; publish — опубликовать для всех; withdraw — снять с раздачи"
+        required: true
+        default: check
+        type: choice
+        options:
+          - check
+          - test
+          - publish
+          - withdraw
+      confirm:
+        description: "test: TEST v<версия>; publish: PUBLISH v<версия>; withdraw: WITHDRAW v<версия>"
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: publish-ugh-release
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: vaankor/ultimate-gaming-hub
+  SOURCE_WORKFLOW: build-windows.yml
+  PYTHONUTF8: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  inputs:
+    name: Check inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Check inputs
+        env:
+          V: ${{ inputs.version }}
+          MODE: ${{ inputs.mode }}
+          CONFIRM: ${{ inputs.confirm }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$V" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "::error::версия '$V' не X.Y.Z"; exit 1; }
+          if [ "$REF_TYPE" != "branch" ] || [ "$REF_NAME" != "main" ]; then
+            echo "::error::запускайте из ветки main (сейчас $REF_TYPE $REF_NAME)"; exit 1
+          fi
+          case "$MODE" in
+            check) ;;
+            test) [ "$CONFIRM" = "TEST v$V" ] || { echo "::error::для пре-релиза введите в confirm ровно: TEST v$V"; exit 1; } ;;
+            publish) [ "$CONFIRM" = "PUBLISH v$V" ] || { echo "::error::для публикации введите в confirm ровно: PUBLISH v$V"; exit 1; } ;;
+            withdraw) [ "$CONFIRM" = "WITHDRAW v$V" ] || { echo "::error::для снятия введите в confirm ровно: WITHDRAW v$V"; exit 1; } ;;
+            *) echo "::error::неизвестный режим"; exit 1 ;;
+          esac
+          echo "OK: $MODE v$V"
+
+  candidate:
+    name: Verify candidate (no signing key)
+    needs: inputs
+    if: inputs.mode != 'withdraw'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: release-source
+    permissions:
+      contents: read
+    outputs:
+      state: ${{ steps.published.outputs.state }}
+      commit: ${{ steps.find.outputs.commit }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      V: ${{ inputs.version }}
+      MODE: ${{ inputs.mode }}
+    steps:
+      - name: Checkout (this repository, main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependency (signature check)
+        run: python -m pip install --disable-pip-version-check --no-cache-dir "cryptography==50.0.1"
+
+      - name: Pinned updater public key
+        run: |
+          set -euo pipefail
+          key=$(tr -d '\r\n' < release-config/updater.pub)
+          if [ -z "$key" ] || [ "$key" = "UGH_UPDATER_PUBKEY_NOT_SET" ]; then
+            echo "::error::release-config/updater.pub — заглушка. Запишите туда открытый ключ (UGH-RELEASE-GUIDE.md, 0.3)"; exit 1
+          fi
+          python - "$key" <<'PY'
+          import sys
+          sys.path.insert(0, "scripts")
+          import ugh_ci_updater as u
+          kid, _ = u.decode_pubkey(sys.argv[1])
+          print(f"OK: закреплённый ключ, id {kid.hex().upper()}")
+          PY
+
+      - name: Find tag, check it is in main, find successful build
+        id: find
+        env:
+          GH_TOKEN: ${{ secrets.UGH_SOURCE_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "$GH_TOKEN" ] || { echo "::error::секрет UGH_SOURCE_TOKEN в Environment release-source не задан"; exit 1; }
+          ref=$(gh api "repos/$SOURCE_REPO/git/ref/tags/v$V") || { echo "::error::в $SOURCE_REPO нет тега v$V"; exit 1; }
+          type=$(jq -r .object.type <<<"$ref"); sha=$(jq -r .object.sha <<<"$ref")
+          if [ "$type" = "tag" ]; then   # аннотированный тег → коммит
+            sha=$(gh api "repos/$SOURCE_REPO/git/tags/$sha" --jq '.object.sha')
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::не удалось определить коммит тега"; exit 1; }
+          # Коммит тега обязан входить в main: main «впереди» или совпадает
+          status=$(gh api "repos/$SOURCE_REPO/compare/$sha...main" --jq '.status')
+          if [ "$status" != "ahead" ] && [ "$status" != "identical" ]; then
+            echo "::error::коммит тега v$V ($sha) не входит в main ($status) — публиковать нельзя"; exit 1
+          fi
+          runs=$(gh api "repos/$SOURCE_REPO/actions/workflows/$SOURCE_WORKFLOW/runs?event=push&status=success&head_sha=$sha&per_page=30")
+          id=$(jq -r --arg tag "v$V" --arg sha "$sha" '[.workflow_runs[]
+                 | select(.head_branch == $tag and .head_sha == $sha and .conclusion == "success"
+                          and .path == ".github/workflows/build-windows.yml")]
+                 | sort_by(.created_at) | last | .id // empty' <<<"$runs")
+          [ -n "$id" ] || { echo "::error::нет успешной сборки build-windows.yml для тега v$V ($sha)"; exit 1; }
+          {
+            echo "commit=$sha"
+            echo "run=$id"
+          } >> "$GITHUB_OUTPUT"
+          echo "OK: тег v$V → $sha (входит в main), сборка $id"
+
+      - name: Download candidate and the tag's config and changelog
+        env:
+          GH_TOKEN: ${{ secrets.UGH_SOURCE_TOKEN }}
+          SHA: ${{ steps.find.outputs.commit }}
+          RUN: ${{ steps.find.outputs.run }}
+        run: |
+          set -euo pipefail
+          gh run download "$RUN" -R "$SOURCE_REPO" -n "UltimateGamingHub-$V-candidate" -D "$RUNNER_TEMP/rc"
+          src="$RUNNER_TEMP/src"
+          mkdir -p "$src"
+          gh api "repos/$SOURCE_REPO/contents/src-tauri/tauri.conf.json?ref=$SHA" --jq .content | base64 -d > "$src/tauri.conf.json"
+          gh api "repos/$SOURCE_REPO/contents/CHANGELOG.md?ref=$SHA" --jq .content | base64 -d > "$src/CHANGELOG.md"
+          for f in CHANGELOG.en.md CHANGELOG.uk.md; do
+            if out=$(gh api "repos/$SOURCE_REPO/contents/$f?ref=$SHA" --jq .content 2> /dev/null); then base64 -d <<<"$out" > "$src/$f"; fi
+          done
+          ls -la "$RUNNER_TEMP/rc" "$src"
+
+      - name: Verify candidate
+        env:
+          SHA: ${{ steps.find.outputs.commit }}
+          RUN: ${{ steps.find.outputs.run }}
+        run: |
+          set -euo pipefail
+          rc="$RUNNER_TEMP/rc"; src="$RUNNER_TEMP/src"
+          update="UltimateGamingHub_${V}_x64-update.exe"
+          endpoint="https://github.com/$GITHUB_REPOSITORY/releases/latest/download/latest.json"
+          want=$(printf '%s\n' "RELEASE_NOTES.md" "SHA256SUMS.txt" "UltimateGamingHub_${V}_x64-setup.exe" "$update" "release-meta.json" | sort)
+          have=$(cd "$rc" && find . -maxdepth 1 -type f -printf '%f\n' | sort)
+          [ "$want" = "$have" ] || { echo "::error::состав кандидата не тот"; diff <(echo "$want") <(echo "$have") || true; exit 1; }
+          (cd "$rc" && sha256sum -c SHA256SUMS.txt)
+          key=$(tr -d '\r\n' < release-config/updater.pub)
+          python - "$rc/release-meta.json" "$V" "$SHA" "$RUN" "$key" "$endpoint" "$src/tauri.conf.json" <<'PY'
+          import json, sys
+          meta = json.load(open(sys.argv[1], encoding="utf-8"))
+          v, sha, run, key, endpoint, conf_path = sys.argv[2:8]
+          conf = json.load(open(conf_path, encoding="utf-8"))
+          upd = conf["plugins"]["updater"]
+          checks = {
+              "версия": meta.get("version") == v and conf.get("version") == v,
+              "тег": meta.get("tag") == f"v{v}",
+              "коммит": meta.get("commit") == sha,
+              "сборка": str(meta.get("run_id")) == run,
+              "ключ в кандидате = закреплённый": meta.get("pubkey") == key,
+              "ключ в tauri.conf.json тега = закреплённый": upd.get("pubkey") == key,
+              "адрес обновлений": meta.get("endpoint") == endpoint and upd.get("endpoints") == [endpoint],
+          }
+          bad = [k for k, ok in checks.items() if not ok]
+          if bad:
+              sys.exit("не совпадает: " + ", ".join(bad))
+          print("OK: release-meta.json и tauri.conf.json тега согласованы с закреплённым ключом и адресом")
+          PY
+          python scripts/ugh_ci_updater.py pubkey --config "$src/tauri.conf.json" --repo "$GITHUB_REPOSITORY"
+          # В программу внутри пакета встроен именно закреплённый ключ и адрес этого репозитория
+          python scripts/ugh_ci_updater.py embedded --nsis "$rc/$update" --pubkey-file release-config/updater.pub --endpoint "$endpoint"
+          # Описание = раздел CHANGELOG.md тега
+          python scripts/ugh_ci_updater.py notes --version "$V" --changelog "$src/CHANGELOG.md" --out "$RUNNER_TEMP/notes.md"
+          cmp "$RUNNER_TEMP/notes.md" "$rc/RELEASE_NOTES.md" || { echo "::error::RELEASE_NOTES.md не совпадает с CHANGELOG.md тега"; exit 1; }
+          echo "OK: кандидат v$V проверен"
+
+      - name: Check published versions (no overwrite, no downgrade)
+        id: published
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          # Анонимно — как увидит программа
+          code=$(curl -sS -o "$RUNNER_TEMP/rel.json" -w '%{http_code}' "https://api.github.com/repos/$repo/releases/tags/v$V" || true)
+          state=none
+          if [ "$code" = "200" ]; then
+            if [ "$(jq -r .prerelease "$RUNNER_TEMP/rel.json")" = "true" ]; then state=prerelease; else state=release; fi
+          fi
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          echo "v$V в $repo: $state"
+          if [ "$state" = "release" ]; then
+            echo "::error::релиз v$V уже опубликован — повторно не публикуем. Выпустите следующую версию."; exit 1
+          fi
+          if [ "$state" = "prerelease" ] && [ "$MODE" = "test" ]; then
+            echo "::error::пре-релиз v$V уже есть. Для публикации всем — mode = publish."; exit 1
+          fi
+          code=$(curl -sSL -o "$RUNNER_TEMP/cur.json" -w '%{http_code}' "https://github.com/$repo/releases/latest/download/latest.json" || true)
+          if [ "$code" = "200" ]; then
+            cur=$(jq -r .version "$RUNNER_TEMP/cur.json")
+            python - "$cur" "$V" <<'PY'
+          import sys
+          k = lambda v: tuple(int(x) for x in v.split("."))
+          cur, new = sys.argv[1], sys.argv[2]
+          if k(new) <= k(cur):
+              sys.exit(f"опубликована {cur}, новая {new} не новее — откат запрещён")
+          print(f"OK: опубликована {cur}, новая {new}")
+          PY
+          else
+            echo "Стабильных версий пока нет (HTTP $code)."
+          fi
+
+      - name: Summary
+        env:
+          SHA: ${{ steps.find.outputs.commit }}
+          STATE: ${{ steps.published.outputs.state }}
+        run: |
+          {
+            echo "### v$V — кандидат проверен"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Режим | $MODE |"
+            echo "| Коммит тега (входит в main) | \`$SHA\` |"
+            echo "| Сейчас в ugh-releases | $STATE |"
+            echo ""
+            if [ "$MODE" = "check" ]; then
+              echo "Ничего не подписано и не опубликовано. Дальше: mode = test (пре-релиз) или publish."
+            else
+              echo "Следующий шаг — подпись: GitHub попросит подтверждение (Environment release-signing)."
+              echo "Подтверждайте, только если версия, режим и коммит выше — те, что вы собирались выпустить."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep verified candidate for signing
+        if: inputs.mode == 'test' || inputs.mode == 'publish'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ugh-candidate
+          path: ${{ runner.temp }}/rc
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  sign:
+    name: Sign (manual approval)
+    needs: candidate
+    # перевод уже проверенного пре-релиза в релиз подписи не требует — файлы остаются те же
+    if: (inputs.mode == 'test' || inputs.mode == 'publish') && needs.candidate.outputs.state != 'prerelease'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release-signing
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      V: ${{ inputs.version }}
+    steps:
+      - name: Checkout (this repository, main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependency (signature check)
+        run: python -m pip install --disable-pip-version-check --no-cache-dir "cryptography==50.0.1"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      # Только Tauri CLI из tools/package-lock.json (хэши пакетов закреплены), скрипты пакетов не выполняются
+      - name: Install Tauri CLI
+        working-directory: tools
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Download verified candidate
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ugh-candidate
+          path: ${{ runner.temp }}/rc
+
+      - name: Re-check candidate integrity
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/rc" && sha256sum -c SHA256SUMS.txt
+
+      - name: Sign update
+        env:
+          # Закрытый ключ — только в этом шаге; GitHub скрывает значения секретов в журнале
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [ -n "$TAURI_SIGNING_PRIVATE_KEY" ] || { echo "::error::секрет TAURI_SIGNING_PRIVATE_KEY в Environment release-signing не задан"; exit 1; }
+          # Ключ — одна строка base64; переводы строк (например, CRLF из Windows) убираются
+          TAURI_SIGNING_PRIVATE_KEY=$(printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" | tr -d '\r\n')
+          export TAURI_SIGNING_PRIVATE_KEY
+          update="$RUNNER_TEMP/rc/UltimateGamingHub_${V}_x64-update.exe"
+          (cd tools && npx --no-install tauri signer sign --app-version "$V" "$update" > /dev/null)
+          [ -s "$update.sig" ] || { echo "::error::подпись не создана"; exit 1; }
+          echo "OK: подпись создана"
+
+      - name: Build and verify latest.json (pinned key)
+        run: |
+          set -euo pipefail
+          rc="$RUNNER_TEMP/rc"; out="$RUNNER_TEMP/signed"
+          mkdir -p "$out"
+          update="UltimateGamingHub_${V}_x64-update.exe"
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/v$V/$update"
+          cp "$rc/$update" "$rc/$update.sig" "$rc/UltimateGamingHub_${V}_x64-setup.exe" "$rc/RELEASE_NOTES.md" "$out/"
+          python scripts/ugh_ci_updater.py manifest --version "$V" --file "$out/$update" --sig "$out/$update.sig" --url "$url" \
+            --notes "$out/RELEASE_NOTES.md" --pub-date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --out "$out/latest.json"
+          python scripts/ugh_ci_updater.py verify --manifest "$out/latest.json" --file "$out/$update" --version "$V" \
+            --pubkey-file release-config/updater.pub --repo "$GITHUB_REPOSITORY" --url "$url"
+          (cd "$out" && sha256sum UltimateGamingHub_* latest.json RELEASE_NOTES.md > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+      - name: Keep signed files for publishing
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ugh-signed
+          path: ${{ runner.temp }}/signed
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    name: Publish
+    needs: [candidate, sign]
+    if: >-
+      always() && needs.candidate.result == 'success' &&
+      (inputs.mode == 'test' || inputs.mode == 'publish') &&
+      (needs.sign.result == 'success' || (needs.sign.result == 'skipped' && needs.candidate.outputs.state == 'prerelease'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      V: ${{ inputs.version }}
+      MODE: ${{ inputs.mode }}
+    steps:
+      - name: Checkout (this repository, main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependency (signature check)
+        run: python -m pip install --disable-pip-version-check --no-cache-dir "cryptography==50.0.1"
+
+      - name: Download verified candidate
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ugh-candidate
+          path: ${{ runner.temp }}/rc
+
+      - name: Download signed files
+        if: needs.sign.result == 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ugh-signed
+          path: ${{ runner.temp }}/signed
+
+      - name: Promote checked pre-release to stable
+        if: needs.candidate.outputs.state == 'prerelease'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [ "$MODE" = "publish" ] || { echo "::error::пре-релиз можно только опубликовать (mode = publish)"; exit 1; }
+          pre="$RUNNER_TEMP/pre"
+          mkdir -p "$pre"
+          # Состав и размеры файлов пре-релиза по данным GitHub
+          gh release view "v$V" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[] | "\(.name) \(.size)"' > "$RUNNER_TEMP/pre-assets.txt"
+          gh release view "v$V" --repo "$GITHUB_REPOSITORY" --json body --jq '.body' > "$RUNNER_TEMP/pre-body.md"
+          # Сами файлы — без авторизации, как их скачает программа
+          for f in "UltimateGamingHub_${V}_x64-setup.exe" "UltimateGamingHub_${V}_x64-update.exe" \
+                   "UltimateGamingHub_${V}_x64-update.exe.sig" latest.json SHA256SUMS.txt; do
+            curl -fsSL -o "$pre/$f" "https://github.com/$GITHUB_REPOSITORY/releases/download/v$V/$f"
+          done
+          # ВСЕ файлы пре-релиза = кандидат сборки: установщик, файл обновления, описание, latest.json
+          # (подпись — закреплённым ключом, = .sig), SHA256SUMS.txt, размеры. Любое расхождение — стоп.
+          if ! python scripts/ugh_ci_updater.py compare-release --release "$pre" --candidate "$RUNNER_TEMP/rc" --version "$V" \
+                 --pubkey-file release-config/updater.pub --repo "$GITHUB_REPOSITORY" \
+                 --assets "$RUNNER_TEMP/pre-assets.txt" --body "$RUNNER_TEMP/pre-body.md"; then
+            echo "::error::пре-релиз v$V не совпадает с кандидатом сборки — в стабильный НЕ переводится"; exit 1
+          fi
+          # Пре-релиз → стабильный «последний»: с этого момента его получают все через обычный адрес
+          gh release edit "v$V" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
+          echo "Проверенный пре-релиз v$V опубликован для всех (файлы не менялись)." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish release
+        if: needs.candidate.outputs.state != 'prerelease'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/signed"
+          (cd "$dir" && sha256sum -c SHA256SUMS.txt)
+          update="UltimateGamingHub_${V}_x64-update.exe"
+          cmp "$dir/$update" "$RUNNER_TEMP/rc/$update" || { echo "::error::подписан не тот файл"; exit 1; }
+          python scripts/ugh_ci_updater.py verify --manifest "$dir/latest.json" --file "$dir/$update" --version "$V" \
+            --pubkey-file release-config/updater.pub --repo "$GITHUB_REPOSITORY"
+          files=("$dir/UltimateGamingHub_${V}_x64-setup.exe" "$dir/$update" "$dir/$update.sig" "$dir/latest.json" "$dir/SHA256SUMS.txt")
+          for f in "${files[@]}"; do printf '%s %s\n' "$(basename "$f")" "$(stat -c %s "$f")"; done | sort > "$RUNNER_TEMP/local.txt"
+          assets() { gh release view "v$V" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[] | "\(.name) \(.size)"' | sort; }
+          if gh release view "v$V" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::уже есть черновик v$V. Проверьте его и удалите вручную, если он от неудачной попытки."; exit 1
+          fi
+          # 1) черновик: пока он не опубликован, программа его не видит
+          gh release create "v$V" --repo "$GITHUB_REPOSITORY" --draft --title "Ultimate Gaming Hub $V" \
+            --notes-file "$dir/RELEASE_NOTES.md" "${files[@]}"
+          # 2) сверка загруженных файлов
+          assets > "$RUNNER_TEMP/up.txt"
+          if ! diff "$RUNNER_TEMP/local.txt" "$RUNNER_TEMP/up.txt"; then
+            echo "::error::загруженные файлы не совпадают — релиз оставлен черновиком, пользователи его не видят"; exit 1
+          fi
+          # 3) test: пре-релиз (не может быть «последним» — программа его не видит); publish: «последний» релиз
+          if [ "$MODE" = "test" ]; then
+            gh release edit "v$V" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --latest=false
+            echo "Пре-релиз: https://github.com/$GITHUB_REPOSITORY/releases/tag/v$V (обычные пользователи его не видят)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            gh release edit "v$V" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+            echo "Опубликовано: https://github.com/$GITHUB_REPOSITORY/releases/tag/v$V" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Verify as the app sees it (anonymous download)
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/public"
+          mkdir -p "$d"
+          update="UltimateGamingHub_${V}_x64-update.exe"
+          repo="$GITHUB_REPOSITORY"
+          stable="https://github.com/$repo/releases/latest/download/latest.json"
+          pre="https://github.com/$repo/releases/download/v$V/latest.json"
+          if [ "$MODE" = "test" ]; then src="$pre"; else src="$stable"; fi
+          ok=""
+          for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            if curl -fsSL -o "$d/latest.json" "$src" && [ "$(jq -r .version "$d/latest.json")" = "$V" ]; then ok=1; break; fi
+            sleep 10
+          done
+          [ -n "$ok" ] || { echo "::error::$src не показывает v$V"; exit 1; }
+          url=$(jq -r '.platforms["windows-x86_64"].url' "$d/latest.json")
+          curl -fsSL -o "$d/$update" "$url"
+          python scripts/ugh_ci_updater.py verify --manifest "$d/latest.json" --file "$d/$update" --version "$V" \
+            --pubkey-file release-config/updater.pub --repo "$repo"
+          if [ "$MODE" = "test" ]; then
+            cur=$(curl -fsSL "$stable" 2> /dev/null | jq -r .version 2> /dev/null || echo "нет")
+            [ "$cur" != "$V" ] || { echo "::error::пре-релиз v$V виден всем как последний"; exit 1; }
+            {
+              echo "Пользователи по-прежнему получают: $cur"
+              echo ""
+              echo "Проверка на своём ПК: \`UGH_UPDATER_ENDPOINT=$pre\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "Проверено без авторизации: $src → v$V, файл скачан, подпись верна (закреплённый ключ)." >> "$GITHUB_STEP_SUMMARY"
+
+  withdraw:
+    name: Withdraw release
+    needs: inputs
+    if: inputs.mode == 'withdraw'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      V: ${{ inputs.version }}
+    steps:
+      - name: Make release a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view "v$V" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease
+          gh release edit "v$V" --repo "$GITHUB_REPOSITORY" --draft=true
+          {
+            echo "Релиз v$V снят с раздачи (черновик). Программа видит предыдущую стабильную версию."
+            echo "Кто уже установил v$V, останется на ней — выпустите исправленную версию с бо́льшим номером."
+          } >> "$GITHUB_STEP_SUMMARY"

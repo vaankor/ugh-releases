@@ -1,0 +1,8 @@
+{
+  "name": "ugh-release-tools",
+  "private": true,
+  "description": "Только Tauri CLI для `tauri signer sign` в workflow публикации. Версия совпадает с package-lock.json программы.",
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.4"
+  }
+}
