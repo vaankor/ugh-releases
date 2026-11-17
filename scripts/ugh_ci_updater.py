@@ -326,7 +326,7 @@ def embedded_strings(nsis, needles):
 def release_names(version):
     upd = f"UltimateGamingHub_{version}_x64-update.exe"
     return {
-        "setup": f"UltimateGamingHub_{version}_x64-setup.exe",
+        "setup": f"ALLIANCE_{version}_x64-setup.exe",
         "update": upd,
         "sig": upd + ".sig",
         "latest": "latest.json",
