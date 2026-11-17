@@ -5,7 +5,7 @@
 
 ## ⬇️ Скачать
 
-**[ALLIANCE 2.0.8 для Windows](https://github.com/vaankor/ugh-releases/releases/latest)** — откройте страницу последней версии и скачайте установщик `…_x64-setup.exe` (Windows 10/11, x64).
+**[ALLIANCE 2.0.35 для Windows](https://github.com/vaankor/ugh-releases/releases/latest)** — откройте страницу последней версии и скачайте установщик `…_x64-setup.exe` (Windows 10/11, x64).
 
 Программа обновляется сама: новая версия ставится только после нажатия «Обновить» и только с верной цифровой подписью.
 
