@@ -195,7 +195,7 @@ jobs:
           rc="$RUNNER_TEMP/rc"; src="$RUNNER_TEMP/src"
           update="UltimateGamingHub_${V}_x64-update.exe"
           endpoint="https://github.com/$GITHUB_REPOSITORY/releases/latest/download/latest.json"
-          want=$(printf '%s\n' "RELEASE_NOTES.md" "SHA256SUMS.txt" "UltimateGamingHub_${V}_x64-setup.exe" "$update" "release-meta.json" | sort)
+          want=$(printf '%s\n' "RELEASE_NOTES.md" "SHA256SUMS.txt" "ALLIANCE_${V}_x64-setup.exe" "$update" "release-meta.json" | sort)
           have=$(cd "$rc" && find . -maxdepth 1 -type f -printf '%f\n' | sort)
           [ "$want" = "$have" ] || { echo "::error::состав кандидата не тот"; diff <(echo "$want") <(echo "$have") || true; exit 1; }
           (cd "$rc" && sha256sum -c SHA256SUMS.txt)
@@ -367,12 +367,12 @@ jobs:
           mkdir -p "$out"
           update="UltimateGamingHub_${V}_x64-update.exe"
           url="https://github.com/$GITHUB_REPOSITORY/releases/download/v$V/$update"
-          cp "$rc/$update" "$rc/$update.sig" "$rc/UltimateGamingHub_${V}_x64-setup.exe" "$rc/RELEASE_NOTES.md" "$out/"
+          cp "$rc/$update" "$rc/$update.sig" "$rc/ALLIANCE_${V}_x64-setup.exe" "$rc/RELEASE_NOTES.md" "$out/"
           python scripts/ugh_ci_updater.py manifest --version "$V" --file "$out/$update" --sig "$out/$update.sig" --url "$url" \
             --notes "$out/RELEASE_NOTES.md" --pub-date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --out "$out/latest.json"
           python scripts/ugh_ci_updater.py verify --manifest "$out/latest.json" --file "$out/$update" --version "$V" \
             --pubkey-file release-config/updater.pub --repo "$GITHUB_REPOSITORY" --url "$url"
-          (cd "$out" && sha256sum UltimateGamingHub_* latest.json RELEASE_NOTES.md > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          (cd "$out" && sha256sum ALLIANCE_* UltimateGamingHub_* latest.json RELEASE_NOTES.md > SHA256SUMS.txt && cat SHA256SUMS.txt)
 
       - name: Keep signed files for publishing
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -440,7 +440,7 @@ jobs:
           gh release view "v$V" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[] | "\(.name) \(.size)"' > "$RUNNER_TEMP/pre-assets.txt"
           gh release view "v$V" --repo "$GITHUB_REPOSITORY" --json body --jq '.body' > "$RUNNER_TEMP/pre-body.md"
           # Сами файлы — без авторизации, как их скачает программа
-          for f in "UltimateGamingHub_${V}_x64-setup.exe" "UltimateGamingHub_${V}_x64-update.exe" \
+          for f in "ALLIANCE_${V}_x64-setup.exe" "UltimateGamingHub_${V}_x64-update.exe" \
                    "UltimateGamingHub_${V}_x64-update.exe.sig" latest.json SHA256SUMS.txt; do
             curl -fsSL -o "$pre/$f" "https://github.com/$GITHUB_REPOSITORY/releases/download/v$V/$f"
           done
@@ -467,7 +467,7 @@ jobs:
           cmp "$dir/$update" "$RUNNER_TEMP/rc/$update" || { echo "::error::подписан не тот файл"; exit 1; }
           python scripts/ugh_ci_updater.py verify --manifest "$dir/latest.json" --file "$dir/$update" --version "$V" \
             --pubkey-file release-config/updater.pub --repo "$GITHUB_REPOSITORY"
-          files=("$dir/UltimateGamingHub_${V}_x64-setup.exe" "$dir/$update" "$dir/$update.sig" "$dir/latest.json" "$dir/SHA256SUMS.txt")
+          files=("$dir/ALLIANCE_${V}_x64-setup.exe" "$dir/$update" "$dir/$update.sig" "$dir/latest.json" "$dir/SHA256SUMS.txt")
           for f in "${files[@]}"; do printf '%s %s\n' "$(basename "$f")" "$(stat -c %s "$f")"; done | sort > "$RUNNER_TEMP/local.txt"
           assets() { gh release view "v$V" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[] | "\(.name) \(.size)"' | sort; }
           if gh release view "v$V" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
